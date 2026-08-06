@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Oregon Scientific SHE101 - RTC Sync & Telemetry</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --text: #f8fafc;
+      --accent: #38bdf8;
+      --success: #34d399;
+      --warn: #fbbf24;
+      --danger: #f87171;
+    }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 20px;
+    }
+
+    .btn-group {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      background: var(--accent);
+      color: #0f172a;
+      font-weight: bold;
+      border: none;
+      padding: 10px 18px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+
+    button:hover { filter: brightness(1.1); }
+    button:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+    button.export { background: var(--success); }
+    button.sync { background: var(--warn); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .card {
+      background: var(--card);
+      padding: 16px;
+      border-radius: 8px;
+      border: 1px solid #334155;
+      text-align: center;
+    }
+
+    .card label {
+      font-size: 0.75rem;
+      color: #94a3b8;
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+
+    .metric {
+      font-size: 1.5rem;
+      font-weight: bold;
+      color: var(--success);
+      margin-top: 6px;
+    }
+
+    #log {
+      font-family: monospace;
+      font-size: 0.8rem;
+      color: var(--accent);
+      white-space: pre-wrap;
+      max-height: 220px;
+      overflow-y: auto;
+      background: #020617;
+      padding: 12px;
+      border-radius: 6px;
+      border: 1px solid #334155;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>Oregon Scientific SHE101 Advanced Controller</h2>
+
+  <div class="btn-group">
+    <button id="connectBtn">Connect Device</button>
+    <button id="rtcBtn" class="sync" disabled>Send RTC Time Sync</button>
+    <button id="burstBtn" disabled>Sweep Query Packets</button>
+    <button id="exportBtn" class="export" disabled>Export CSV</button>
+  </div>
+
+  <div class="grid">
+    <div class="card"><label>PM 1.0</label><div class="metric" id="pm10_val">-- µg/m³</div></div>
+    <div class="card"><label>PM 2.5</label><div class="metric" id="pm25_val">-- µg/m³</div></div>
+    <div class="card"><label>PM 10</label><div class="metric" id="pm100_val">-- µg/m³</div></div>
+    <div class="card"><label>VOC</label><div class="metric" id="voc_val">-- ppm</div></div>
+    <div class="card"><label>Humidity</label><div class="metric" id="hum_val">-- %</div></div>
+    <div class="card"><label>Temperature</label><div class="metric" id="temp_val">-- °C</div></div>
+  </div>
+
+  <div class="card" style="margin-bottom: 20px;">
+    <canvas id="chart" height="80"></canvas>
+  </div>
+
+  <div class="card">
+    <div style="text-align: left; margin-bottom: 6px;"><strong>Connection & Protocol Stream:</strong></div>
+    <div id="log">Plug SHE101 into 5V wall power, then click Connect Device...</div>
+  </div>
+
+  <script>
+    const SERVICE_UUID = '74e7feaa-c6a4-11e2-b7a9-0002a5d5c51b';
+    const NOTIFY_UUID  = '74e7aa05-c6a4-11e2-b7a9-0002a5d5c51b';
+    const WRITE_UUID   = '74e7aa06-c6a4-11e2-b7a9-0002a5d5c51b';
+
+    let writeChar = null;
+    let heartbeatTimer = null;
+    const csvRecords = [];
+
+    const historyData = { labels: [], pm25: [], voc: [], temp: [] };
+    const chart = new Chart(document.getElementById('chart').getContext('2d'), {
+      type: 'line',
+      data: {
+        labels: historyData.labels,
+        datasets: [
+          { label: 'PM 2.5 (µg/m³)', data: historyData.pm25, borderColor: '#f87171', fill: false, tension: 0.2 },
+          { label: 'VOC (ppm)', data: historyData.voc, borderColor: '#38bdf8', fill: false, tension: 0.2 },
+          { label: 'Temp (°C)', data: historyData.temp, borderColor: '#34d399', fill: false, tension: 0.2 }
+        ]
+      },
+      options: { responsive: true, scales: { y: { beginAtZero: true } } }
+    });
+
+    function log(msg) {
+      const l = document.getElementById('log');
+      l.innerText += '\n' + msg;
+      l.scrollTop = l.scrollHeight;
+    }
+
+    async function sendPacket(bytes) {
+      if (!writeChar) return;
+      const hex = bytes.map(b => '0x' + b.toString(16).padStart(2, '0')).join(', ');
+      log(`--> Tx: [${hex}]`);
+      try {
+        await writeChar.writeValueWithResponse(new Uint8Array(bytes));
+      } catch (e) {
+        await writeChar.writeValueWithoutResponse(new Uint8Array(bytes));
+      }
+    }
+
+    // Constructs a valid 0xAA 0x08 Real-Time Clock calibration packet
+    async function sendRtcSync() {
+      const now = new Date();
+      const year = now.getFullYear() % 100; // 2-digit year
+      const month = now.getMonth() + 1;
+      const day = now.getDate();
+      const hour = now.getHours();
+      const min = now.getMinutes();
+      const sec = now.getSeconds();
+
+      const payload = [0xAA, 0x08, 0x06, year, month, day, hour, min, sec];
+      let chksum = 0;
+      for (let i = 1; i < payload.length; i++) chksum += payload[i];
+      payload.push(chksum & 0xFF);
+      payload.push(0xAB);
+
+      log('Sending Real-Time Clock (RTC) Sync Frame...');
+      await sendPacket(payload);
+    }
+
+    function handleTelemetry(evt) {
+      const raw = new Uint8Array(evt.target.value.buffer);
+      const dataView = new DataView(evt.target.value.buffer);
+      const hex = Array.from(raw).map(b => b.toString(16).padStart(2, '0')).join(' ');
+      
+      log(`\n========================================`);
+      log(`>>> TELEMETRY PACKET RECEIVED [${raw.length} bytes]: ${hex}`);
+      log(`========================================\n`);
+
+      if (raw.length >= 15) {
+        // Dynamic offset detection for packet header (0xAA or 0xFF)
+        const offset = (raw[0] === 0xAA || raw[0] === 0xFF) ? 0 : 2;
+        
+        const pm1_0 = (raw[offset + 7] * 256) + raw[offset + 8];
+        const pm2_5 = (raw[offset + 9] * 256) + raw[offset + 10];
+        const pm10  = (raw[offset + 11] * 256) + raw[offset + 12];
+        const voc   = (((raw[offset + 13] * 256) + raw[offset + 14]) / 1000.0).toFixed(2);
+        
+        let hum = '--';
+        let temp = '--';
+        if (raw.length >= offset + 19) {
+          hum  = Math.floor(((raw[offset + 15] * 256) + raw[offset + 16]) / 1000);
+          temp = (dataView.getInt16(offset + 17, false) / 100.0).toFixed(1);
+        }
+
+        document.getElementById('pm10_val').innerText = `${pm1_0} µg/m³`;
+        document.getElementById('pm25_val').innerText = `${pm2_5} µg/m³`;
+        document.getElementById('pm100_val').innerText = `${pm10} µg/m³`;
+        document.getElementById('voc_val').innerText = `${voc} ppm`;
+        document.getElementById('hum_val').innerText = `${hum} %`;
+        document.getElementById('temp_val').innerText = `${temp} °C`;
+
+        const timestamp = new Date().toISOString();
+        csvRecords.push({ timestamp, pm1_0, pm2_5, pm10, voc, hum, temp });
+        document.getElementById('exportBtn').disabled = false;
+
+        const tsShort = new Date().toLocaleTimeString();
+        historyData.labels.push(tsShort);
+        historyData.pm25.push(pm2_5);
+        historyData.voc.push(voc);
+        historyData.temp.push(temp);
+
+        if (historyData.labels.length > 25) {
+          historyData.labels.shift();
+          historyData.pm25.shift();
+          historyData.voc.shift();
+          historyData.temp.shift();
+        }
+        chart.update();
+      }
+    }
+
+    document.getElementById('connectBtn').addEventListener('click', async () => {
+      try {
+        log('Scanning for XSHE device...');
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: 'XSHE' }],
+          optionalServices: [SERVICE_UUID]
+        });
+
+        log(`Connecting to ${device.name}...`);
+        const server = await device.gatt.connect();
+
+        log('Opening Service...');
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        const notifyChar = await service.getCharacteristic(NOTIFY_UUID);
+        writeChar = await service.getCharacteristic(WRITE_UUID);
+
+        log('Subscribing to notifications (74e7aa05)...');
+        await notifyChar.startNotifications();
+        notifyChar.addEventListener('characteristicvaluechanged', handleTelemetry);
+        log('Notifications active (CCCD bound).');
+
+        // STEP 1: Send RTC Time Sync
+        await sendRtcSync();
+        await new Promise(r => setTimeout(r, 300));
+
+        // STEP 2: Send Start Measurement Mode Vector
+        log('Sending Start Measurement Vector...');
+        await sendPacket([0xAA, 0x01, 0x01, 0x00, 0x02, 0xAB]);
+        await new Promise(r => setTimeout(r, 200));
+        await sendPacket([0xAA, 0x50, 0x01, 0x00, 0x51, 0xAB]);
+
+        document.getElementById('rtcBtn').disabled = false;
+        document.getElementById('burstBtn').disabled = false;
+
+        // STEP 3: Start continuous 5-second polling loop
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        heartbeatTimer = setInterval(async () => {
+          await sendPacket([0xAA, 0x50, 0x01, 0x00, 0x51, 0xAB]);
+        }, 5000);
+
+        log('Device initialized & 5-second polling loop active.');
+
+      } catch (err) {
+        log(`ERROR: ${err.message}`);
+      }
+    });
+
+    document.getElementById('rtcBtn').addEventListener('click', async () => {
+      await sendRtcSync();
+    });
+
+    document.getElementById('burstBtn').addEventListener('click', async () => {
+      log('Sweeping multi-frame query structures...');
+      const queries = [
+        [0xAA, 0x03, 0x00, 0x03, 0xAB],
+        [0xAA, 0x20, 0x01, 0x00, 0x21, 0xAB],
+        [0xAA, 0x30, 0x01, 0x00, 0x31, 0xAB],
+        [0xAA, 0x50, 0x01, 0x00, 0x51, 0xAB]
+      ];
+      for (const q of queries) {
+        await sendPacket(q);
+        await new Promise(r => setTimeout(r, 250));
+      }
+    });
+
+    document.getElementById('exportBtn').addEventListener('click', () => {
+      if (csvRecords.length === 0) return;
+      let csv = 'Timestamp,PM1.0 (ug/m3),PM2.5 (ug/m3),PM10 (ug/m3),VOC (ppm),Humidity (%),Temp (C)\n';
+      csvRecords.forEach(r => {
+        csv += `${r.timestamp},${r.pm1_0},${r.pm2_5},${r.pm10},${r.voc},${r.hum},${r.temp}\n`;
+      });
+
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `SHE101_Telemetry_${Date.now()}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>

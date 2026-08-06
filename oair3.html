@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Oregon Scientific SHE101 Monitor</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 20px; background: #121212; color: #fff; }
+    .card { background: #1e1e1e; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+    .metric { font-size: 1.5rem; font-weight: bold; color: #4caf50; }
+    .btn-group { margin-bottom: 15px; display: flex; gap: 10px; flex-wrap: wrap; }
+    button { background: #2196f3; color: white; border: none; padding: 12px 20px; border-radius: 6px; font-size: 1rem; cursor: pointer; }
+    button.secondary { background: #333; border: 1px solid #555; }
+    button.danger { background: #d32f2f; }
+    #log { font-family: monospace; font-size: 0.85rem; color: #4af; white-space: pre-wrap; max-height: 200px; overflow-y: auto; background: #000; padding: 10px; border-radius: 4px; border: 1px solid #333; }
+  </style>
+</head>
+<body>
+
+  <h2>Oregon SHE101 Air Monitor</h2>
+  
+  <div class="btn-group">
+    <button id="connectBtn">Connect Device</button>
+    <button id="exportBtn" class="secondary">Export CSV</button>
+    <button id="clearBtn" class="danger">Clear History</button>
+  </div>
+  
+  <p id="status">Status: Disconnected</p>
+
+  <div class="grid">
+    <div class="card"><div>PM2.5</div><div class="metric" id="pm25">-- µg/m³</div></div>
+    <div class="card"><div>PM10</div><div class="metric" id="pm10">-- µg/m³</div></div>
+    <div class="card"><div>VOC</div><div class="metric" id="voc">-- ppm</div></div>
+    <div class="card"><div>Temp / Humidity</div><div class="metric" id="env">--°C / --%</div></div>
+  </div>
+
+  <div class="card">
+    <canvas id="historyChart"></canvas>
+  </div>
+
+  <div class="card">
+    <div><strong>Debug Log:</strong></div>
+    <div id="log">Ready to connect...</div>
+  </div>
+
+  <script>
+    let bleDevice;
+    let gattServer;
+    const STORAGE_KEY = 'she101_history_logs';
+    let storedLogs = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
+
+    const historyData = {
+      labels: storedLogs.map(entry => entry.time),
+      pm25: storedLogs.map(entry => entry.pm25),
+      pm10: storedLogs.map(entry => entry.pm10)
+    };
+
+    const ctx = document.getElementById('historyChart').getContext('2d');
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: historyData.labels,
+        datasets: [
+          { label: 'PM2.5 (µg/m³)', data: historyData.pm25, borderColor: '#4caf50', fill: false },
+          { label: 'PM10 (µg/m³)', data: historyData.pm10, borderColor: '#ff9800', fill: false }
+        ]
+      },
+      options: { responsive: true, scales: { x: { display: true }, y: { beginAtZero: true } } }
+    });
+
+    function logMsg(msg) {
+      const logDiv = document.getElementById('log');
+      logDiv.innerText += '\n' + msg;
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    // Helper timeout wrapper for GATT promises
+    function withTimeout(promise, ms, timeoutMsg) {
+      return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(timeoutMsg)), ms))
+      ]);
+    }
+
+    document.getElementById('connectBtn').addEventListener('click', async () => {
+      try {
+        document.getElementById('status').innerText = 'Scanning...';
+        logMsg('Requesting Bluetooth Device...');
+
+        // Common vendor service UUIDs used by Oregon Scientific and generic sensor modules
+        const targetServices = [
+          '0000ffe0-0000-1000-8000-00805f9b34fb',
+          '0000fff0-0000-1000-8000-00805f9b34fb',
+          '0000181a-0000-1000-8000-00805f9b34fb',
+          '0000180a-0000-1000-8000-00805f9b34fb',
+          '0000f00d-0000-1000-8000-00805f9b34fb'
+        ];
+
+        bleDevice = await navigator.bluetooth.requestDevice({
+          acceptAllDevices: true,
+          optionalServices: targetServices
+        });
+
+        logMsg(`Selected: ${bleDevice.name || 'Unnamed'}. Connecting to GATT...`);
+        gattServer = await bleDevice.gatt.connect();
+        document.getElementById('status').innerText = 'Connected! Querying services...';
+
+        logMsg('Searching primary services...');
+
+        let services = [];
+        try {
+          services = await withTimeout(gattServer.getPrimaryServices(), 7000, 'Service discovery timed out');
+        } catch (e) {
+          logMsg(`Notice: ${e.message}. Attempting direct UUID lookup...`);
+          for (const uuid of targetServices) {
+            try {
+              const s = await gattServer.getPrimaryService(uuid);
+              if (s) services.push(s);
+            } catch (err) { /* ignore missing */ }
+          }
+        }
+
+        logMsg(`Found ${services.length} active service(s).`);
+
+        let subscribed = false;
+        for (const service of services) {
+          logMsg(`Inspecting Service: ${service.uuid}`);
+          try {
+            const characteristics = await service.getCharacteristics();
+            for (const c of characteristics) {
+              logMsg(` -> Char: ${c.uuid} | Read:${c.properties.read} Notify:${c.properties.notify} Indicate:${c.properties.indicate}`);
+
+              if ((c.properties.notify || c.properties.indicate) && !subscribed) {
+                await c.startNotifications();
+                c.addEventListener('characteristicvaluechanged', handleData);
+                document.getElementById('status').innerText = 'Receiving Data!';
+                logMsg(`>>> Subscribed to notifications on characteristic: ${c.uuid}`);
+                subscribed = true;
+              }
+            }
+          } catch (err) {
+            logMsg(` -> Error checking chars in ${service.uuid}: ${err.message}`);
+          }
+        }
+
+        if (!subscribed) {
+          logMsg('No active notify characteristics found. Check Debug Log output above.');
+        }
+
+      } catch (error) {
+        document.getElementById('status').innerText = 'Error: ' + error.message;
+        logMsg('ERROR: ' + error.message);
+      }
+    });
+
+    function handleData(event) {
+      const value = event.target.value;
+      const rawBytes = new Uint8Array(value.buffer);
+      const hexString = Array.from(rawBytes).map(b => b.toString(16).padStart(2, '0')).join(' ');
+      logMsg(`DATA [${rawBytes.length}b]: ${hexString}`);
+
+      if (rawBytes.length >= 4) {
+        const pm25 = (rawBytes[0] << 8) | rawBytes[1];
+        const pm10 = (rawBytes[2] << 8) | rawBytes[3];
+
+        document.getElementById('pm25').innerText = `${pm25} µg/m³`;
+        document.getElementById('pm10').innerText = `${pm10} µg/m³`;
+
+        const timestamp = new Date().toLocaleTimeString();
+        storedLogs.push({ time: timestamp, pm25: pm25, pm10: pm10 });
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(storedLogs));
+
+        historyData.labels.push(timestamp);
+        historyData.pm25.push(pm25);
+        historyData.pm10.push(pm10);
+
+        if (historyData.labels.length > 50) {
+          historyData.labels.shift();
+          historyData.pm25.shift();
+          historyData.pm10.shift();
+        }
+        chart.update();
+      }
+    }
+
+    document.getElementById('exportBtn').addEventListener('click', () => {
+      if (storedLogs.length === 0) return alert("No historical data.");
+      let csvContent = "data:text/csv;charset=utf-8,Timestamp,PM2.5,PM10\n";
+      storedLogs.forEach(r => csvContent += `"${r.time}",${r.pm25},${r.pm10}\n`);
+      const link = document.createElement("a");
+      link.href = encodeURI(csvContent);
+      link.download = `SHE101_Data_${Date.now()}.csv`;
+      link.click();
+    });
+
+    document.getElementById('clearBtn').addEventListener('click', () => {
+      if (confirm("Clear history?")) {
+        localStorage.removeItem(STORAGE_KEY);
+        storedLogs = [];
+        historyData.labels.length = 0;
+        historyData.pm25.length = 0;
+        historyData.pm10.length = 0;
+        chart.update();
+      }
+    });
+  </script>
+</body>
+</html>

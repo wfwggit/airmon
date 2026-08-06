@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Oregon Scientific SHE101 Monitor</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 20px; background: #121212; color: #fff; }
+    .card { background: #1e1e1e; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+    .metric { font-size: 1.5rem; font-weight: bold; color: #4caf50; }
+    .btn-group { margin-bottom: 15px; display: flex; gap: 8px; flex-wrap: wrap; }
+    button { background: #2196f3; color: white; border: none; padding: 10px 16px; border-radius: 6px; font-size: 0.9rem; cursor: pointer; }
+    button.secondary { background: #333; border: 1px solid #555; }
+    button.cmd { background: #8e24aa; }
+    button.danger { background: #d32f2f; }
+    #log { font-family: monospace; font-size: 0.85rem; color: #4af; white-space: pre-wrap; max-height: 220px; overflow-y: auto; background: #000; padding: 10px; border-radius: 4px; border: 1px solid #333; }
+  </style>
+</head>
+<body>
+
+  <h2>Oregon SHE101 Air Monitor</h2>
+  
+  <div class="btn-group">
+    <button id="connectBtn">Connect XSHE101N</button>
+    <button id="autoPollBtn" class="secondary">Toggle Auto-Poll (2s)</button>
+    <button id="exportBtn" class="secondary">Export CSV</button>
+    <button id="clearBtn" class="danger">Clear History</button>
+  </div>
+
+  <div class="card">
+    <div style="margin-bottom: 8px;"><strong>Test Command Suite:</strong></div>
+    <div class="btn-group">
+      <button class="cmd" onclick="sendBytes([0x01])">Cmd: [0x01]</button>
+      <button class="cmd" onclick="sendBytes([0xAA, 0x01])">Cmd: [0xAA, 0x01]</button>
+      <button class="cmd" onclick="sendBytes([0xCA, 0x01])">Cmd: [0xCA, 0x01]</button>
+      <button class="cmd" onclick="sendBytes([0x00, 0x01, 0x00])">Cmd: [0x00, 0x01, 0x00]</button>
+      <button class="cmd" onclick="sendBytes([0xFD, 0x01, 0x01])">Cmd: [0xFD, 0x01, 0x01]</button>
+    </div>
+  </div>
+  
+  <p id="status">Status: Disconnected</p>
+
+  <div class="grid">
+    <div class="card"><div>PM2.5</div><div class="metric" id="pm25">-- µg/m³</div></div>
+    <div class="card"><div>PM10</div><div class="metric" id="pm10">-- µg/m³</div></div>
+    <div class="card"><div>VOC</div><div class="metric" id="voc">-- ppm</div></div>
+    <div class="card"><div>Temp / Humidity</div><div class="metric" id="env">--°C / --%</div></div>
+  </div>
+
+  <div class="card">
+    <canvas id="historyChart"></canvas>
+  </div>
+
+  <div class="card">
+    <div><strong>Raw Byte Debug Log:</strong></div>
+    <div id="log">Click Connect to start...</div>
+  </div>
+
+  <script>
+    const SERVICE_UUID     = '74e7feaa-c6a4-11e2-b7a9-0002a5d5c51b'; 
+    const NOTIFY_CHAR_UUID = '74e7aa05-c6a4-11e2-b7a9-0002a5d5c51b';
+    const WRITE_CHAR_UUID  = '74e7aa06-c6a4-11e2-b7a9-0002a5d5c51b';
+
+    let bleDevice, gattServer, writeChar, notifyChar;
+    let pollInterval = null;
+    const STORAGE_KEY = 'she101_history_logs';
+    let storedLogs = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
+
+    const historyData = {
+      labels: storedLogs.map(entry => entry.time),
+      pm25: storedLogs.map(entry => entry.pm25),
+      pm10: storedLogs.map(entry => entry.pm10)
+    };
+
+    const ctx = document.getElementById('historyChart').getContext('2d');
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: historyData.labels,
+        datasets: [
+          { label: 'PM2.5 (µg/m³)', data: historyData.pm25, borderColor: '#4caf50', fill: false },
+          { label: 'PM10 (µg/m³)', data: historyData.pm10, borderColor: '#ff9800', fill: false }
+        ]
+      },
+      options: { responsive: true, scales: { x: { display: true }, y: { beginAtZero: true } } }
+    });
+
+    function logMsg(msg) {
+      const logDiv = document.getElementById('log');
+      logDiv.innerText += '\n' + msg;
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    document.getElementById('connectBtn').addEventListener('click', async () => {
+      try {
+        document.getElementById('status').innerText = 'Scanning...';
+        logMsg('Requesting Bluetooth Device...');
+
+        bleDevice = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: 'XSHE' }],
+          optionalServices: [SERVICE_UUID]
+        });
+
+        logMsg(`Connecting to ${bleDevice.name}...`);
+        gattServer = await bleDevice.gatt.connect();
+        document.getElementById('status').innerText = 'Connected! Querying service...';
+
+        const service = await gattServer.getPrimaryService(SERVICE_UUID);
+        
+        notifyChar = await service.getCharacteristic(NOTIFY_CHAR_UUID);
+        await notifyChar.startNotifications();
+        notifyChar.addEventListener('characteristicvaluechanged', handleData);
+        logMsg(`Subscribed to Notify Characteristic (${NOTIFY_CHAR_UUID})`);
+
+        try {
+          writeChar = await service.getCharacteristic(WRITE_CHAR_UUID);
+          logMsg(`Found Write Characteristic (${WRITE_CHAR_UUID})`);
+        } catch (e) {
+          logMsg(`Write setup notice: ${e.message}`);
+        }
+
+        document.getElementById('status').innerText = 'Connected & Listening!';
+        logMsg('>>> Ready. Try clicking test commands above if data stream does not start.');
+
+      } catch (error) {
+        document.getElementById('status').innerText = 'Error: ' + error.message;
+        logMsg('ERROR: ' + error.message);
+      }
+    });
+
+    async function sendBytes(byteArray) {
+      if (!writeChar) return alert("Device not connected or write characteristic unavailable.");
+      try {
+        const payload = new Uint8Array(byteArray);
+        await writeChar.writeValueWithoutResponse(payload);
+        logMsg(`TX -> [${Array.from(payload).map(b => '0x' + b.toString(16).padStart(2, '0')).join(', ')}]`);
+      } catch (err) {
+        logMsg(`TX Error: ${err.message}`);
+      }
+    }
+
+    document.getElementById('autoPollBtn').addEventListener('click', () => {
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+        logMsg('Auto-polling stopped.');
+      } else {
+        pollInterval = setInterval(() => {
+          sendBytes([0xAA, 0x01]);
+        }, 2000);
+        logMsg('Auto-polling started (2s interval)...');
+      }
+    });
+
+    function handleData(event) {
+      const value = event.target.value;
+      const rawBytes = new Uint8Array(value.buffer);
+      const hexString = Array.from(rawBytes).map(b => b.toString(16).padStart(2, '0')).join(' ');
+      logMsg(`RX <- [${rawBytes.length}b]: ${hexString}`);
+
+      if (rawBytes.length >= 4) {
+        const pm25 = (rawBytes[0] << 8) | rawBytes[1];
+        const pm10 = (rawBytes[2] << 8) | rawBytes[3];
+
+        document.getElementById('pm25').innerText = `${pm25} µg/m³`;
+        document.getElementById('pm10').innerText = `${pm10} µg/m³`;
+
+        const timestamp = new Date().toLocaleTimeString();
+        storedLogs.push({ time: timestamp, pm25: pm25, pm10: pm10 });
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(storedLogs));
+
+        historyData.labels.push(timestamp);
+        historyData.pm25.push(pm25);
+        historyData.pm10.push(pm10);
+
+        if (historyData.labels.length > 50) {
+          historyData.labels.shift();
+          historyData.pm25.shift();
+          historyData.pm10.shift();
+        }
+        chart.update();
+      }
+    }
+
+    document.getElementById('exportBtn').addEventListener('click', () => {
+      if (storedLogs.length === 0) return alert("No historical data.");
+      let csvContent = "data:text/csv;charset=utf-8,Timestamp,PM2.5,PM10\n";
+      storedLogs.forEach(r => csvContent += `"${r.time}",${r.pm25},${r.pm10}\n`);
+      const link = document.createElement("a");
+      link.href = encodeURI(csvContent);
+      link.download = `SHE101_Data_${Date.now()}.csv`;
+      link.click();
+    });
+
+    document.getElementById('clearBtn').addEventListener('click', () => {
+      if (confirm("Clear history?")) {
+        localStorage.removeItem(STORAGE_KEY);
+        storedLogs = [];
+        historyData.labels.length = 0;
+        historyData.pm25.length = 0;
+        historyData.pm10.length = 0;
+        chart.update();
+      }
+    });
+  </script>
+</body>
+</html>
